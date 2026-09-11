@@ -170,6 +170,72 @@ else
   AC_SUBST(ssl_requires)
 fi
 
+# legacy branch: idevice.c's own connection-layer SSL/TLS (the actual
+# handshake with a device's lockdownd -- idevice_connection_enable_ssl() and
+# the transport it wraps) is independently selectable from the HAVE_OPENSSL
+# choice above, which only ever governed common/userpref.c's cert-generation
+# code and stays completely unaffected by this option. This exists because
+# neither OpenSSL nor GnuTLS builds this project links against can negotiate
+# the real SSLv3 this fork's target hardware (pre-2013 Apple TV/iOS
+# lockdownd) requires -- confirmed directly: the original OpenSSL branch
+# hardcoded SSL_CTX_set_min_proto_version(ssl_ctx, TLS1_VERSION), a TLS 1.0
+# floor. wolfSSL is the one currently-maintained TLS library that still
+# supports SSLv3 (--enable-sslv3), for exactly this kind of legacy-
+# compatibility use case -- see idevice.c for the rest of that story.
+# mbedTLS is accepted as a recognized value for future extensibility but
+# genuinely can't do what this option exists for (mbedTLS dropped SSLv3 in
+# 3.0.0), so it's a clean configure-time error rather than a silently broken
+# build -- implement it here first if that ever changes.
+AC_ARG_WITH([ssl-implementation],
+            [AS_HELP_STRING([--with-ssl-implementation=@<:@auto/openssl/gnutls/wolfssl/mbedtls@:>@],
+            [TLS library used by idevice.c's own connection-layer SSL/TLS (default: auto, i.e. whichever HAVE_OPENSSL/GnuTLS choice was already made above -- the original behavior). Independent of --disable-openssl, which only affects common/userpref.c's cert generation.])],
+            [with_ssl_implementation=$withval],
+            [with_ssl_implementation=auto])
+
+case "$with_ssl_implementation" in
+  auto)
+    if test "x$enable_openssl" = "xyes"; then
+      AC_DEFINE(LIBIMOBILEDEVICE_SSL_IMPLEMENTATION_OPENSSL, 1, [idevice.c's own SSL/TLS layer is built against OpenSSL])
+    else
+      AC_DEFINE(LIBIMOBILEDEVICE_SSL_IMPLEMENTATION_GNUTLS, 1, [idevice.c's own SSL/TLS layer is built against GnuTLS])
+    fi
+    ;;
+  openssl)
+    if test "x$enable_openssl" != "xyes"; then
+      AC_MSG_ERROR([--with-ssl-implementation=openssl requires OpenSSL to also be available (see --disable-openssl above)])
+    fi
+    AC_DEFINE(LIBIMOBILEDEVICE_SSL_IMPLEMENTATION_OPENSSL, 1, [idevice.c's own SSL/TLS layer is built against OpenSSL])
+    ;;
+  gnutls)
+    if test "x$enable_openssl" = "xyes"; then
+      # HAVE_OPENSSL is still defined for userpref.c; idevice.c just makes
+      # its own separate choice to build against GnuTLS instead.
+      pkg_req_gnutls="gnutls >= 2.2.0"
+      pkg_req_libtasn1="libtasn1 >= 1.1"
+      PKG_CHECK_MODULES(libgnutls, $pkg_req_gnutls)
+      AC_CHECK_LIB(gcrypt, gcry_control, [AC_SUBST(libgcrypt_LIBS,[-lgcrypt])], [AC_MSG_ERROR([libgcrypt is required to build idevice.c's SSL layer with GnuTLS])])
+      PKG_CHECK_MODULES(libtasn1, $pkg_req_libtasn1)
+    fi
+    AC_DEFINE(LIBIMOBILEDEVICE_SSL_IMPLEMENTATION_GNUTLS, 1, [idevice.c's own SSL/TLS layer is built against GnuTLS])
+    ;;
+  wolfssl)
+    pkg_req_wolfssl="wolfssl"
+    PKG_CHECK_MODULES(wolfssl, $pkg_req_wolfssl, have_wolfssl=yes, have_wolfssl=no)
+    if test "x$have_wolfssl" != "xyes"; then
+      AC_MSG_ERROR([--with-ssl-implementation=wolfssl requested but wolfSSL could not be found via pkg-config])
+    fi
+    AC_DEFINE(LIBIMOBILEDEVICE_SSL_IMPLEMENTATION_WOLFSSL, 1, [idevice.c's own SSL/TLS layer is built against wolfSSL])
+    AC_SUBST(wolfssl_CFLAGS)
+    AC_SUBST(wolfssl_LIBS)
+    ;;
+  mbedtls)
+    AC_MSG_ERROR([--with-ssl-implementation=mbedtls is a recognized value but idevice.c has no mbedTLS backend yet (mbedTLS dropped SSLv3 support in 3.0.0, which is why this option exists at all -- wolfssl is almost certainly what you want)])
+    ;;
+  *)
+    AC_MSG_ERROR([Unknown --with-ssl-implementation value '$with_ssl_implementation' -- expected auto, openssl, gnutls, wolfssl, or mbedtls])
+    ;;
+esac
+
 AC_ARG_ENABLE([debug-code],
             [AS_HELP_STRING([--enable-debug-code],
             [enable debug message reporting in library (default is no)])],

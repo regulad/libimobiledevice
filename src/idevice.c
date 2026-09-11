@@ -30,12 +30,16 @@
 #include <errno.h>
 
 #include <usbmuxd.h>
-#ifdef HAVE_OPENSSL
+#if defined(LIBIMOBILEDEVICE_SSL_IMPLEMENTATION_WOLFSSL)
+/* wolfssl/ssl.h (and wolfssl/options.h before it) already pulled in via
+ * idevice.h below -- wolfSSL's native API has no separate err.h/rsa.h split
+ * the way OpenSSL does, so nothing further is needed here. */
+#elif defined(LIBIMOBILEDEVICE_SSL_IMPLEMENTATION_GNUTLS)
+#include <gnutls/gnutls.h>
+#else
 #include <openssl/err.h>
 #include <openssl/rsa.h>
 #include <openssl/ssl.h>
-#else
-#include <gnutls/gnutls.h>
 #endif
 
 #include "idevice.h"
@@ -52,7 +56,7 @@
 #define ETIMEDOUT 138
 #endif
 
-#ifdef HAVE_OPENSSL
+#ifdef LIBIMOBILEDEVICE_SSL_IMPLEMENTATION_OPENSSL
 
 #if OPENSSL_VERSION_NUMBER < 0x10100000L || \
 	(defined(LIBRESSL_VERSION_NUMBER) && (LIBRESSL_VERSION_NUMBER < 0x20020000L))
@@ -101,11 +105,11 @@ static void id_function(CRYPTO_THREADID *thread)
 }
 #endif
 #endif
-#endif /* HAVE_OPENSSL */
+#endif /* LIBIMOBILEDEVICE_SSL_IMPLEMENTATION_OPENSSL */
 
 static void internal_idevice_init(void)
 {
-#ifdef HAVE_OPENSSL
+#ifdef LIBIMOBILEDEVICE_SSL_IMPLEMENTATION_OPENSSL
 #if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 	int i;
 	SSL_library_init();
@@ -123,6 +127,8 @@ static void internal_idevice_init(void)
 #endif
 	CRYPTO_set_locking_callback(locking_function);
 #endif
+#elif defined(LIBIMOBILEDEVICE_SSL_IMPLEMENTATION_WOLFSSL)
+	wolfSSL_Init();
 #else
 	gnutls_global_init();
 #endif
@@ -130,7 +136,7 @@ static void internal_idevice_init(void)
 
 static void internal_idevice_deinit(void)
 {
-#ifdef HAVE_OPENSSL
+#ifdef LIBIMOBILEDEVICE_SSL_IMPLEMENTATION_OPENSSL
 #if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 	int i;
 	if (mutex_buf) {
@@ -151,6 +157,8 @@ static void internal_idevice_deinit(void)
 	SSL_COMP_free_compression_methods();
 	openssl_remove_thread_state();
 #endif
+#elif defined(LIBIMOBILEDEVICE_SSL_IMPLEMENTATION_WOLFSSL)
+	wolfSSL_Cleanup();
 #else
 	gnutls_global_deinit();
 #endif
@@ -496,8 +504,10 @@ LIBIMOBILEDEVICE_API idevice_error_t idevice_connection_send(idevice_connection_
 	if (connection->ssl_data) {
 		uint32_t sent = 0;
 		while (sent < len) {
-#ifdef HAVE_OPENSSL
+#if defined(LIBIMOBILEDEVICE_SSL_IMPLEMENTATION_OPENSSL)
 			int s = SSL_write(connection->ssl_data->session, (const void*)(data+sent), (int)(len-sent));
+#elif defined(LIBIMOBILEDEVICE_SSL_IMPLEMENTATION_WOLFSSL)
+			int s = wolfSSL_write(connection->ssl_data->session, (const void*)(data+sent), (int)(len-sent));
 #else
 			ssize_t s = gnutls_record_send(connection->ssl_data->session, (void*)(data+sent), (size_t)(len-sent));
 #endif
@@ -570,8 +580,10 @@ LIBIMOBILEDEVICE_API idevice_error_t idevice_connection_receive_timeout(idevice_
 		int do_select = 1;
 
 		while (received < len) {
-#ifdef HAVE_OPENSSL
+#if defined(LIBIMOBILEDEVICE_SSL_IMPLEMENTATION_OPENSSL)
 			do_select = (SSL_pending(connection->ssl_data->session) == 0);
+#elif defined(LIBIMOBILEDEVICE_SSL_IMPLEMENTATION_WOLFSSL)
+			do_select = (wolfSSL_pending(connection->ssl_data->session) == 0);
 #endif
 			if (do_select) {
 				int conn_error = socket_check_fd((int)(long)connection->data, FDM_READ, timeout);
@@ -587,8 +599,10 @@ LIBIMOBILEDEVICE_API idevice_error_t idevice_connection_receive_timeout(idevice_
 				}
 			}
 
-#ifdef HAVE_OPENSSL
+#if defined(LIBIMOBILEDEVICE_SSL_IMPLEMENTATION_OPENSSL)
 			int r = SSL_read(connection->ssl_data->session, (void*)((char*)(data+received)), (int)len-received);
+#elif defined(LIBIMOBILEDEVICE_SSL_IMPLEMENTATION_WOLFSSL)
+			int r = wolfSSL_read(connection->ssl_data->session, (void*)((char*)(data+received)), (int)len-received);
 #else
 			ssize_t r = gnutls_record_recv(connection->ssl_data->session, (void*)(data+received), (size_t)len-received);
 #endif
@@ -641,9 +655,12 @@ LIBIMOBILEDEVICE_API idevice_error_t idevice_connection_receive(idevice_connecti
 	}
 
 	if (connection->ssl_data) {
-#ifdef HAVE_OPENSSL
+#if defined(LIBIMOBILEDEVICE_SSL_IMPLEMENTATION_OPENSSL)
 		int received = SSL_read(connection->ssl_data->session, (void*)data, (int)len);
 		debug_info("SSL_read %d, received %d", len, received);
+#elif defined(LIBIMOBILEDEVICE_SSL_IMPLEMENTATION_WOLFSSL)
+		int received = wolfSSL_read(connection->ssl_data->session, (void*)data, (int)len);
+		debug_info("wolfSSL_read %d, received %d", len, received);
 #else
 		ssize_t received = gnutls_record_recv(connection->ssl_data->session, (void*)data, (size_t)len);
 #endif
@@ -691,7 +708,7 @@ LIBIMOBILEDEVICE_API idevice_error_t idevice_get_udid(idevice_t device, char **u
 	return IDEVICE_E_SUCCESS;
 }
 
-#ifndef HAVE_OPENSSL
+#if defined(LIBIMOBILEDEVICE_SSL_IMPLEMENTATION_GNUTLS)
 /**
  * Internally used gnutls callback function for receiving encrypted data.
  */
@@ -763,12 +780,19 @@ static void internal_ssl_cleanup(ssl_data_t ssl_data)
 	if (!ssl_data)
 		return;
 
-#ifdef HAVE_OPENSSL
+#if defined(LIBIMOBILEDEVICE_SSL_IMPLEMENTATION_OPENSSL)
 	if (ssl_data->session) {
 		SSL_free(ssl_data->session);
 	}
 	if (ssl_data->ctx) {
 		SSL_CTX_free(ssl_data->ctx);
+	}
+#elif defined(LIBIMOBILEDEVICE_SSL_IMPLEMENTATION_WOLFSSL)
+	if (ssl_data->session) {
+		wolfSSL_free(ssl_data->session);
+	}
+	if (ssl_data->ctx) {
+		wolfSSL_CTX_free(ssl_data->ctx);
 	}
 #else
 	if (ssl_data->session) {
@@ -792,7 +816,7 @@ static void internal_ssl_cleanup(ssl_data_t ssl_data)
 #endif
 }
 
-#ifdef HAVE_OPENSSL
+#ifdef LIBIMOBILEDEVICE_SSL_IMPLEMENTATION_OPENSSL
 static int ssl_verify_callback(int ok, X509_STORE_CTX *ctx)
 {
 	return 1;
@@ -827,7 +851,7 @@ static const char *ssl_error_to_string(int e)
 #endif
 #endif
 
-#ifndef HAVE_OPENSSL
+#if defined(LIBIMOBILEDEVICE_SSL_IMPLEMENTATION_GNUTLS)
 /**
  * Internally used gnutls callback function that gets called during handshake.
  */
@@ -866,7 +890,7 @@ LIBIMOBILEDEVICE_API idevice_error_t idevice_connection_enable_ssl(idevice_conne
 		return IDEVICE_E_INVALID_ARG;
 
 	idevice_error_t ret = IDEVICE_E_SSL_ERROR;
-#ifdef HAVE_OPENSSL
+#ifdef LIBIMOBILEDEVICE_SSL_IMPLEMENTATION_OPENSSL
 	uint32_t return_me = 0;
 #else
 	int return_me = 0;
@@ -879,7 +903,7 @@ LIBIMOBILEDEVICE_API idevice_error_t idevice_connection_enable_ssl(idevice_conne
 		return ret;
 	}
 
-#ifdef HAVE_OPENSSL
+#ifdef LIBIMOBILEDEVICE_SSL_IMPLEMENTATION_OPENSSL
 	key_data_t root_cert = { NULL, 0 };
 	key_data_t root_privkey = { NULL, 0 };
 
@@ -973,6 +997,98 @@ LIBIMOBILEDEVICE_API idevice_error_t idevice_connection_enable_ssl(idevice_conne
 	}
 	/* required for proper multi-thread clean up to prevent leaks */
 	openssl_remove_thread_state();
+#elif defined(LIBIMOBILEDEVICE_SSL_IMPLEMENTATION_WOLFSSL)
+	/* legacy branch: this project's whole reason for a --with-ssl-implementation
+	 * option at all. Uses the pair record's HOST certificate/key, not ROOT
+	 * (unlike the OpenSSL branch above) -- confirmed correct against real
+	 * pre-2013 Apple TV/iOS hardware; ROOT-as-client-cert was never verified
+	 * to also work there and targets iOS 5+/TLS1.0-era devices specifically
+	 * (see this function's OpenSSL branch's SSL_CTX_set_min_proto_version
+	 * call, a TLS 1.0 floor real SSLv3-only lockdownd can never pass). Uses
+	 * wolfSSL_set_fd() directly (a real fd from usbmuxd_connect(), same as
+	 * the OpenSSL branch) rather than custom I/O callbacks -- no bespoke
+	 * transport here to plug them into.
+	 */
+	key_data_t host_cert = { NULL, 0 };
+	key_data_t host_privkey = { NULL, 0 };
+
+	pair_record_import_crt_with_name(pair_record, USERPREF_HOST_CERTIFICATE_KEY, &host_cert);
+	pair_record_import_key_with_name(pair_record, USERPREF_HOST_PRIVATE_KEY_KEY, &host_privkey);
+
+	if (pair_record)
+		plist_free(pair_record);
+
+	if (!host_cert.data || !host_privkey.data) {
+		debug_info("ERROR: Failed enabling SSL. Pair record missing host cert/key for udid %s.", connection->device->udid);
+		free(host_cert.data);
+		free(host_privkey.data);
+		return ret;
+	}
+
+	WOLFSSL_CTX *ssl_ctx = wolfSSL_CTX_new(wolfSSLv3_client_method());
+	if (!ssl_ctx) {
+		debug_info("ERROR: Could not create SSL context.");
+		free(host_cert.data);
+		free(host_privkey.data);
+		return ret;
+	}
+
+	wolfSSL_CTX_set_verify(ssl_ctx, WOLFSSL_VERIFY_NONE, NULL);
+
+	/* RC4-MD5: the historically documented cipher for this era of Apple TV/
+	 * iOS lockdownd SSL. wolfSSL compiles out the entire classic static-RSA
+	 * cipher suite family (the only kind valid for real SSLv3) by default;
+	 * this project's own wolfssl_ext build re-enables it via
+	 * WOLFSSL_STATIC_RSA, but the default cipher list is still modern-suite-
+	 * oriented, so it must be requested explicitly -- confirmed necessary
+	 * directly against real hardware: without this, wolfSSL sends an
+	 * effectively-empty cipher list and the device RSTs within milliseconds. */
+	if (wolfSSL_CTX_set_cipher_list(ssl_ctx, "RC4-MD5") != WOLFSSL_SUCCESS) {
+		debug_info("ERROR: Could not set cipher list.");
+		wolfSSL_CTX_free(ssl_ctx);
+		free(host_cert.data);
+		free(host_privkey.data);
+		return ret;
+	}
+
+	if (wolfSSL_CTX_use_certificate_buffer(ssl_ctx, host_cert.data, (long)host_cert.size, WOLFSSL_FILETYPE_PEM) != WOLFSSL_SUCCESS) {
+		debug_info("ERROR: Could not load host certificate.");
+		wolfSSL_CTX_free(ssl_ctx);
+		free(host_cert.data);
+		free(host_privkey.data);
+		return ret;
+	}
+	if (wolfSSL_CTX_use_PrivateKey_buffer(ssl_ctx, host_privkey.data, (long)host_privkey.size, WOLFSSL_FILETYPE_PEM) != WOLFSSL_SUCCESS) {
+		debug_info("ERROR: Could not load host private key.");
+		wolfSSL_CTX_free(ssl_ctx);
+		free(host_cert.data);
+		free(host_privkey.data);
+		return ret;
+	}
+	free(host_cert.data);
+	free(host_privkey.data);
+
+	WOLFSSL *ssl = wolfSSL_new(ssl_ctx);
+	if (!ssl) {
+		debug_info("ERROR: Could not create SSL object");
+		wolfSSL_CTX_free(ssl_ctx);
+		return ret;
+	}
+	wolfSSL_set_fd(ssl, (int)(long)connection->data);
+
+	return_me = wolfSSL_connect(ssl);
+	if (return_me != WOLFSSL_SUCCESS) {
+		debug_info("ERROR in wolfSSL_connect: err=%d", wolfSSL_get_error(ssl, return_me));
+		wolfSSL_free(ssl);
+		wolfSSL_CTX_free(ssl_ctx);
+	} else {
+		ssl_data_t ssl_data_loc = (ssl_data_t)malloc(sizeof(struct ssl_data_private));
+		ssl_data_loc->session = ssl;
+		ssl_data_loc->ctx = ssl_ctx;
+		connection->ssl_data = ssl_data_loc;
+		ret = IDEVICE_E_SUCCESS;
+		debug_info("SSL mode enabled");
+	}
 #else
 	ssl_data_t ssl_data_loc = (ssl_data_t)malloc(sizeof(struct ssl_data_private));
 
@@ -1051,7 +1167,7 @@ LIBIMOBILEDEVICE_API idevice_error_t idevice_connection_disable_bypass_ssl(idevi
 	// some services require plain text communication after SSL handshake
 	// sending out SSL_shutdown will cause bytes
 	if (!sslBypass) {
-#ifdef HAVE_OPENSSL
+#if defined(LIBIMOBILEDEVICE_SSL_IMPLEMENTATION_OPENSSL)
 		if (connection->ssl_data->session) {
 			/* see: https://www.openssl.org/docs/ssl/SSL_shutdown.html#RETURN_VALUES */
 			if (SSL_shutdown(connection->ssl_data->session) == 0) {
@@ -1059,6 +1175,19 @@ LIBIMOBILEDEVICE_API idevice_error_t idevice_connection_disable_bypass_ssl(idevi
 				int ssl_error;
 				if ((ssl_error = SSL_get_error(connection->ssl_data->session, 0)) == SSL_ERROR_NONE) {
 					SSL_shutdown(connection->ssl_data->session);
+				} else  {
+					debug_info("Skipping bidirectional SSL shutdown. SSL error code: %i\n", ssl_error);
+				}
+			}
+		}
+#elif defined(LIBIMOBILEDEVICE_SSL_IMPLEMENTATION_WOLFSSL)
+		if (connection->ssl_data->session) {
+			/* see: https://www.wolfssl.com/documentation/manuals/wolfssl/group__Setup.html#function-wolfssl_shutdown */
+			if (wolfSSL_shutdown(connection->ssl_data->session) == 0) {
+				/* Only try bidirectional shutdown if we know it can complete */
+				int ssl_error;
+				if ((ssl_error = wolfSSL_get_error(connection->ssl_data->session, 0)) == WOLFSSL_ERROR_NONE) {
+					wolfSSL_shutdown(connection->ssl_data->session);
 				} else  {
 					debug_info("Skipping bidirectional SSL shutdown. SSL error code: %i\n", ssl_error);
 				}
